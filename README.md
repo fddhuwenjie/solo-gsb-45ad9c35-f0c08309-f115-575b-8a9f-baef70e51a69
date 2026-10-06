@@ -21,15 +21,25 @@ docker compose up --build
 
 - **工序递增**：`POST /steps` 的 `seq` 必须等于上一条已接受回执 +1，跳号整步拒绝。
 - **连接在位判定**：榫卯连接/临时支撑只有**自身在位且两端构件均实际在位**
-  （固定支承点恒在位）才参与施工与永久连通性判断。为尚未安装的替换件预登记的
+  （在用固定支承点恒在位）才参与施工与永久连通性判断。为尚未安装的替换件预登记的
   默认在位榫卯只是"允许端点组合"，在替换件实际安装前沿路不生效；该规则在重建
   连接图时实时计算，数据库中已登记的同类记录同样遵循，无需迁移。
+- **支承点检修（停用/启用）**：固定支承点可经工序暂时停用检修
+  （`deactivate_support`）、完成后按工序启用（`activate_support`）；两者都是普通
+  工序（占用连续工序号），也可列入预案清单走预演/确认。停用期间该点退出连接图：
+  搭在它身上的连接、临时支撑均不提供传力路径，也不得以它为端点新装连接或临时
+  支撑（409 `support_inactive`）；若停用使某在位构件无法经其他在用支承点获得
+  施工期支承，按原有 409 `unreachable` 语义指出首个受影响构件，整步不留改动；
+  启用后重新按当前连接检查路径。**每次停用/启用都使连接状态版本 +1**——此前的
+  试载全部失效，卸撑与验收快照只认当前版本下的合格试载（历史快照不改）。状态
+  持久保存于 SQLite，旧库的支承点一律默认在用；`/state` 新增 `supports_detail`
+  显示各支承点检修状态（`active=false` 为停用检修中），原有 `supports` 等字段保留。
 - **施工中可达性**：每个改变连接图的工序提交后、以及试载时重建连接图——每个在位
-  承重构件必须能经**在位连接或临时支撑**抵达某个固定支承点，否则整步回滚。
+  承重构件必须能经**在位连接或临时支撑**抵达某个在用固定支承点，否则整步回滚。
 - **卸撑**：卸除临时支撑后，每个在位承重构件必须**仅凭永久连接**抵达支承点，且每个构件
   都有在**当前连接状态版本**下通过、载荷不低于其 `min_load` 的试载记录。
-- **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件）版本 +1；试载记录当时版本，
-  图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
+- **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件、支承点停用/启用）
+  版本 +1；试载记录当时版本，图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
 - **改接限制**：安装连接只允许使用事先登记的端点组合（`POST /connections` 登记的 id）。
 - **整步拒绝**：跳号、端点不在位、可达性或卸撑条件不满足时返回 409，
   响应含 `first_affected_component`（首个受影响构件），已有回执与状态不变。
@@ -59,11 +69,11 @@ docker compose up --build
 | POST | `/replacements` | 登记替换件 `{id, name, min_load}`（初始不在位） |
 | POST | `/connections` | 登记榫卯连接 `{id, a, b, in_place?}`（默认 true；改接预留组合传 false） |
 | POST | `/temp-supports` | 登记临时支撑 `{id, a, b, in_place?}`（默认 false） |
-| POST | `/steps` | 提交工序回执（见下） |
+| POST | `/steps` | 提交工序回执（含支承点停用/启用，见下） |
 | POST | `/plan/preview` | 预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动） |
 | POST | `/plan/confirm` | 凭据确认：写事务内验签并复核整单，凭据整单仅可用一次 |
 | GET | `/steps`、`/steps/{seq}` | 查询各工序回执与结果 |
-| GET | `/state` | 当前连接图、各构件可达性与最近试载 |
+| GET | `/state` | 当前连接图、各构件可达性与最近试载、各支承点检修状态 |
 | POST | `/snapshots` | 卸撑完成后固化验收快照 |
 | GET | `/snapshots`、`/snapshots/{id}` | 查询快照 |
 | GET | `/supports` `/components` `/replacements` `/connections` `/temp-supports` | 登记簿查询 |
@@ -84,6 +94,10 @@ docker compose up --build
 {"seq": 4, "action": "test_load", "component": "C1", "load": 12}
 // 卸撑
 {"seq": 6, "action": "remove_support", "id": "T1"}
+// 停用支承点检修（该点及其上连接、临时支撑退出传力路径）
+{"seq": 7, "action": "deactivate_support", "id": "S1"}
+// 检修完成，启用支承点（重新按当前连接检查路径）
+{"seq": 8, "action": "activate_support", "id": "S1"}
 ```
 
 ## 可执行调用示例
@@ -241,6 +255,70 @@ curl -X POST $B/snapshots -d '{}'
 curl -X POST $B/steps -d '{"seq":7,"action":"test_load","component":"PC1","load":11}'
 ```
 
+## 支承点检修：停用受阻、绕行与启用后复验
+
+固定支承点的停用（`deactivate_support`）与启用（`activate_support`）是普通工序，
+占用连续工序号，也可列入预案清单走预演/确认。停用后该点及搭在它身上的连接、
+临时支撑均不提供传力路径，也不得以它为端点新装连接或支撑；每次停/启都使连接
+状态版本 +1，此前的试载全部失效——卸撑与验收快照只认当前版本下的合格试载。
+
+一键执行（含断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_maintenance.sh
+```
+
+逐条手动执行：
+
+```bash
+B=http://localhost:8080
+
+# 1) 登记：承重梁 C1 经榫卯 J1 落在北柱础 S1 上；S2 为另一在用支承点
+curl -X POST $B/supports      -d '{"id":"S1","name":"北柱础"}'
+curl -X POST $B/supports      -d '{"id":"S2","name":"南台基"}'
+curl -X POST $B/components    -d '{"id":"C1","name":"承重梁","min_load":10}'
+curl -X POST $B/connections   -d '{"id":"J1","a":"S1","b":"C1"}'
+curl -X POST $B/temp-supports -d '{"id":"T1","a":"S2","b":"C1"}'
+
+# 2) 停用受阻：C1 唯一支承路径挂在 S1 上，直接停用 → 409 指出首个受影响构件
+curl -X POST $B/steps -d '{"seq":1,"action":"deactivate_support","id":"S1"}'
+#   → 409 unreachable
+#     {"error":"unreachable",
+#      "message":"本工序后构件 C1 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
+#      "first_affected_component":"C1"}
+#   整步不留改动：无 seq 1 回执，S1 仍在用（/state 的 supports_detail 可查）
+
+# 3) 借助其他支承点绕行：先搭设 S2—C1 临时支撑，再停用 S1 即放行
+curl -X POST $B/steps -d '{"seq":1,"action":"install","target":"temp_support","id":"T1"}'
+curl -X POST $B/steps -d '{"seq":2,"action":"deactivate_support","id":"S1"}'
+#   → 201 result={"support":"S1","active":false,"version":1}
+#     停用使版本 +1（v1），此前试载全部失效；C1 经 T1→S2 仍有施工期支承
+
+# 4) 停用期间：不得以 S1 为端点新装连接或临时支撑
+curl -X POST $B/connections -d '{"id":"J2","a":"S1","b":"C1","in_place":false}'
+curl -X POST $B/steps -d '{"seq":3,"action":"install","target":"connection","id":"J2"}'
+#   → 409 support_inactive（支承点 S1 停用检修中，不得作为新装端点）
+
+# 5) 启用后复验：启用同样使版本 +1（v2），停用期间的试载随之失效
+curl -X POST $B/steps -d '{"seq":3,"action":"test_load","component":"C1","load":11}'
+curl -X POST $B/steps -d '{"seq":4,"action":"activate_support","id":"S1"}'
+#   → 201 result={"support":"S1","active":true,"version":2}
+curl -X POST $B/steps -d '{"seq":5,"action":"remove_support","id":"T1"}'
+#   → 409 test_load_missing：当前版本 v2 下无合格试载，须复验
+curl -X POST $B/steps -d '{"seq":5,"action":"test_load","component":"C1","load":12.5}'
+curl -X POST $B/steps -d '{"seq":6,"action":"remove_support","id":"T1"}'   # 201
+curl -X POST $B/snapshots -d '{}'                                          # 201 验收快照
+
+# 6) 停启也可列入预案清单：预演逐步反映停启对后续工序的影响且不落库；
+#    确认凭据随停启后的状态变化失效（409 plan_stale），确认失败仍整单回滚，
+#    成功仍只可提交一次（详见上节"施工预案"与 demo_maintenance.sh 第 6、7 步）
+curl -X POST $B/plan/preview -d '{"steps":[
+  {"action":"deactivate_support","id":"S2"},
+  {"action":"activate_support","id":"S2"}
+]}'
+#   → 200 {"ok":true,"token":"planv2-…","steps":[每步预计结果含版本递进],…}
+```
+
 ## 故障与修复示例：未安装替换件不得充当传力路径
 
 登记固定支承点 `S`、在位承重梁 `C`、**未安装**替换件 `R`，以及 `S—R`、`R—C`
@@ -315,7 +393,9 @@ curl $B/snapshots/1
 | `not_registered` | 连接/支撑/构件未事先登记 |
 | `endpoint_not_in_place` | 端点不在位（附 `first_affected_component`） |
 | `not_in_place` / `already_in_place` | 拆卸/安装对象状态不符 |
-| `unreachable` | 工序后（含试载时）构件无法经在位连接或临时支撑抵达固定支承点 |
+| `already_inactive` / `not_inactive` | 支承点已停用 / 本就在用，停启状态不符 |
+| `support_inactive` | 支承点停用检修中，不得作为新装连接/临时支撑的端点（附 `support`） |
+| `unreachable` | 工序后（含试载、支承点停用时）构件无法经在位连接或临时支撑抵达在用固定支承点 |
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
 | `test_load_missing` | 构件缺少当前连接状态下通过的合格试载 |
 | `shoring_incomplete` | 临时支撑未卸完，不能固化快照 |
@@ -333,5 +413,6 @@ docker-compose.yml  # 单条命令启动，卷持久化
 demo.sh             # 端到端演示脚本
 demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现与修复演示
 demo_plan.sh        # 施工预案演示：预演 → 过期拒绝 → 一次写事务确认
+demo_maintenance.sh # 支承点检修演示：停用受阻 → 绕行 → 启用后复验 → 预案停启
 README.md
 ```
