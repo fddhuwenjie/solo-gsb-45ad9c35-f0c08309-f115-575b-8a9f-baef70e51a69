@@ -3,7 +3,11 @@
 
 领域模型
 --------
-- 固定支承点 supports：基础/柱础等锚固点，永远在位。
+- 固定支承点 supports：基础/柱础等锚固点，永远在位；施工期可经工序
+  deactivate_support 暂时停用检修、activate_support 重新启用（状态持久化，
+  旧库支承点默认在用）。停用期间该点不作为传力根，挂在它身上的连接/临时支撑
+  沿路不生效，也不得以它为端点新安装连接或支撑；每次停启都递增连接状态版本，
+  旧试载随之失效。
 - 承重构件 components：登记时带最低试载值 min_load；origin 为 original（初始在位）
   或 replacement（替换件，登记时不在位，安装工序后在位）。
 - 榫卯连接 connections：事先登记的"允许端点组合"，in_place 表示是否在位；
@@ -24,10 +28,16 @@
   构件实际在位（见上）。
 - 卸撑（remove_support）：卸除后每个在位承重构件必须仅凭永久连接抵达支承点，
   且每个在位承重构件都有在当前连接状态版本下通过、载荷不低于其最低值的试载。
-- 连接状态版本 version：永久连接图每次变化（装/拆连接、拆构件、装构件）递增；
-  试载记录当时版本，版本过期即失效。临时支撑的装/卸不改变版本。
+- 连接状态版本 version：永久连接图每次变化（装/拆连接、拆构件、装构件、支承点
+  停用/启用）递增；试载记录当时版本，版本过期即失效。临时支撑的装/卸不改变版本。
 - 卸撑全部完成后可 POST /snapshots 固化验收快照；快照只增不改，
   后续修复工序不会改写旧快照。
+- 支承点停用/启用：停用是带校验的工序——停用后每个在位构件仍须能经其他在用
+  支承点获得施工期支承，否则按原有 409 unreachable 语义指出首个受影响构件、
+  整步不留改动；启用后同样按当前连接重新校验施工期路径。停启与普通工序一样
+  走 /steps 与预案预演/确认（逐步可见、预演不落库、凭据随状态变化失效、确认
+  失败整单回滚、成功仅可提交一次）；每次停启都使旧试载失效，卸撑与验收快照
+  只认当前版本的合格试载，历史快照不改。
 
 施工预案
 --------
@@ -69,6 +79,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS supports (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    in_service INTEGER NOT NULL DEFAULT 1,  -- 1 在用；0 施工期停用检修
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS components (
@@ -138,11 +149,19 @@ def init_db():
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate_support_status(conn)  # 旧库支承点补列 in_service，默认在用
         conn.execute("INSERT OR IGNORE INTO meta(k, v) VALUES('version', '0')")
         _ensure_server_secret(conn)   # 旧库首次启动同样补建服务端密钥
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_support_status(conn):
+    """旧库 supports 无 in_service 列时补列：存量固定支承点默认在用。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(supports)")}
+    if "in_service" not in cols:
+        conn.execute("ALTER TABLE supports ADD COLUMN in_service INTEGER NOT NULL DEFAULT 1")
 
 
 # 服务端密钥：只存在本进程内存与 SQLite meta 表，永不下发；用于 HMAC 签发/
@@ -211,7 +230,11 @@ def _bump(conn):
 
 
 def _live_nodes(conn, comps, sups):
-    """当前实际在位的节点集合：固定支承点恒在位，外加在位构件。"""
+    """当前实际在位的节点集合：在用固定支承点恒在位，外加在位构件。
+
+    停用检修的支承点不在位：它不能作为传力路径，挂在它身上的连接/临时支撑
+    沿路不生效。sups 仅含在用支承点 id（见 _graph）。
+    """
     live = set(sups)
     for c in comps:
         if c["in_place"]:
@@ -220,15 +243,18 @@ def _live_nodes(conn, comps, sups):
 
 
 def _graph(conn):
-    """重建当前连接图：在位构件、支承点、在位永久连接、在位临时支撑。
+    """重建当前连接图：在位构件、在用支承点、在位永久连接、在位临时支撑。
 
-    连接/支撑只有自身在位且两端节点均实际在位（支承点恒在位）才作为
-    有效边返回；未安装替换件身上的"默认在位"榫卯不参与任何路径判断。
+    连接/支撑只有自身在位且两端节点均实际在位（在用支承点恒在位）才作为
+    有效边返回；未安装替换件身上的"默认在位"榫卯、停用检修支承点身上的
+    连接/支撑均不参与任何路径判断。
     """
     comps = conn.execute(
         "SELECT id, name, min_load, origin, in_place FROM components ORDER BY rowid"
     ).fetchall()
-    sups = [r["id"] for r in conn.execute("SELECT id FROM supports ORDER BY rowid")]
+    sup_rows = conn.execute(
+        "SELECT id, name, in_service FROM supports ORDER BY rowid").fetchall()
+    sups = [r["id"] for r in sup_rows if r["in_service"]]
     live = _live_nodes(conn, comps, sups)
 
     def _live_edges(rows):
@@ -237,7 +263,7 @@ def _graph(conn):
 
     perm = _live_edges(conn.execute("SELECT a, b FROM connections WHERE in_place=1"))
     temp = _live_edges(conn.execute("SELECT a, b FROM temp_supports WHERE in_place=1"))
-    return comps, sups, perm, temp
+    return comps, sup_rows, sups, perm, temp
 
 
 def _reachable(supports, edges):
@@ -280,8 +306,8 @@ def _first_untested(conn, comps, version):
 
 
 def _check_construction_reachability(conn):
-    """施工中校验：每个在位构件经在位连接或临时支撑抵达固定支承点。"""
-    comps, sups, perm, temp = _graph(conn)
+    """施工中校验：每个在位构件经在位连接或临时支撑抵达在用固定支承点。"""
+    comps, _sup_rows, sups, perm, temp = _graph(conn)
     seen = _reachable(sups, perm + temp)
     bad = _first_unreachable(comps, seen)
     if bad:
@@ -302,9 +328,17 @@ def _get(conn, table, oid, what):
 
 
 def _require_endpoints(conn, *eps):
-    """端点须已登记且在位（支承点恒在位）。"""
+    """端点须已登记且在位（在用支承点恒在位；停用检修的支承点不得作为端点）。"""
     for ep in eps:
-        if conn.execute("SELECT 1 FROM supports WHERE id=?", (ep,)).fetchone():
+        srow = conn.execute(
+            "SELECT in_service FROM supports WHERE id=?", (ep,)).fetchone()
+        if srow is not None:
+            if not srow["in_service"]:
+                raise reject(
+                    "support_out_of_service",
+                    f"支承点 {ep} 已停用检修，不得以其为端点安装连接或临时支撑，整步拒绝",
+                    component=ep,
+                )
             continue
         row = conn.execute("SELECT in_place FROM components WHERE id=?", (ep,)).fetchone()
         if row is None:
@@ -519,8 +553,8 @@ def _apply_remove_support(conn, body):
     if not row["in_place"]:
         raise reject("not_in_place", f"临时支撑 {oid} 不在位，无法卸撑")
     conn.execute("UPDATE temp_supports SET in_place=0 WHERE id=?", (oid,))
-    # 卸撑条件一：仅凭永久连接抵达固定支承点
-    comps, sups, perm, _temp = _graph(conn)
+    # 卸撑条件一：仅凭永久连接抵达在用固定支承点
+    comps, _sup_rows, sups, perm, _temp = _graph(conn)
     seen = _reachable(sups, perm)
     bad = _first_unreachable(comps, seen)
     if bad:
@@ -546,11 +580,37 @@ def _apply_remove_support(conn, body):
     }
 
 
+def _apply_support_status(conn, body, in_service):
+    """固定支承点停用检修 / 重新启用。
+
+    停用后该点不再是传力根、挂在它身上的连接与临时支撑沿路失效；启用后重新
+    按当前连接检查路径。两者都重建连接图做施工中可达性校验（不满足按原有
+    409 unreachable 指出首个受影响构件、整步回滚），并递增连接状态版本：
+    每次停启都使旧试载失效，卸撑与验收快照只认当前版本的合格试载。
+    """
+    oid = body.get("id")
+    row = _get(conn, "supports", oid, "支承点")
+    want = 1 if in_service else 0
+    if row["in_service"] == want:
+        if in_service:
+            raise reject("already_in_place", f"支承点 {oid} 当前在用，无需启用")
+        raise reject("support_out_of_service", f"支承点 {oid} 已停用检修，无需重复停用")
+    conn.execute("UPDATE supports SET in_service=? WHERE id=?", (want, oid))
+    v = _bump(conn)
+    return {
+        "support": oid,
+        "in_service": in_service,
+        "maintenance": not in_service,
+        "version": v,
+    }
+
+
 def _apply_action(conn, seq, action, body):
     """按动作套用单步工序并返回执行结果。
 
     装/拆改变连接图，试载也必须作用于当前经在位连接或临时支承可达的构件，
-    因此这三类工序套用后重建连接图做施工中校验（卸撑在自身函数内做更严校验）。
+    支承点停用/启用同样改变连接图，因此这几类工序套用后重建连接图做施工中
+    校验（卸撑在自身函数内做更严校验）。
     """
     if action == "install":
         result = _apply_install(conn, body)
@@ -558,9 +618,14 @@ def _apply_action(conn, seq, action, body):
         result = _apply_disassemble(conn, body)
     elif action == "test_load":
         result = _apply_test_load(conn, seq, body)
+    elif action == "deactivate_support":
+        result = _apply_support_status(conn, body, False)
+    elif action == "activate_support":
+        result = _apply_support_status(conn, body, True)
     else:
         result = _apply_remove_support(conn, body)
-    if action in ("install", "disassemble", "test_load"):
+    if action in ("install", "disassemble", "test_load",
+                  "deactivate_support", "activate_support"):
         _check_construction_reachability(conn)
     return result
 
@@ -588,8 +653,11 @@ def create_step(body):
     seq, action = body.get("seq"), body.get("action")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
         raise bad_request("seq 须为正整数")
-    if action not in ("install", "disassemble", "test_load", "remove_support"):
-        raise bad_request("action 须为 install/disassemble/test_load/remove_support")
+    if action not in ("install", "disassemble", "test_load", "remove_support",
+                      "deactivate_support", "activate_support"):
+        raise bad_request(
+            "action 须为 install/disassemble/test_load/remove_support/"
+            "deactivate_support/activate_support")
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -630,9 +698,11 @@ def _normalize_plan_items(conn, body, enforce_continuity):
             raise bad_request(f"清单第 {i + 1} 项须为 JSON 对象")
         item = dict(raw)
         action = item.get("action")
-        if action not in ("install", "disassemble", "test_load", "remove_support"):
+        if action not in ("install", "disassemble", "test_load", "remove_support",
+                          "deactivate_support", "activate_support"):
             raise bad_request(
-                f"清单第 {i + 1} 项 action 须为 install/disassemble/test_load/remove_support")
+                f"清单第 {i + 1} 项 action 须为 install/disassemble/test_load/"
+                "remove_support/deactivate_support/activate_support")
         seq = item.get("seq")
         expected = last + 1 + i
         if seq is None:
@@ -783,7 +853,7 @@ def create_snapshot(_body):
                 f"卸撑未完成：临时支撑 {left[0]} 仍在位，不能固化验收快照",
                 temp_support=left[0],
             )
-        comps, sups, perm, _temp = _graph(conn)
+        comps, sup_rows, sups, perm, _temp = _graph(conn)
         seen = _reachable(sups, perm)
         bad = _first_unreachable(comps, seen)
         if bad:
@@ -829,6 +899,9 @@ def create_snapshot(_body):
             "version": v,
             "last_seq": last,
             "supports": sups,
+            "supports_in_maintenance": [
+                {"id": r["id"], "name": r["name"]}
+                for r in sup_rows if not r["in_service"]],
             "components": comp_list,
             "connections_in_place": joints,
             "steps": receipts,
@@ -858,6 +931,8 @@ def list_table(table):
         for r in rows:
             if "in_place" in r:
                 r["in_place"] = bool(r["in_place"])
+            if "in_service" in r:
+                r["in_service"] = bool(r["in_service"])
         return 200, rows
     finally:
         conn.close()
@@ -896,7 +971,7 @@ def get_step(seq):
 def get_state():
     conn = connect()
     try:
-        comps, sups, perm, temp = _graph(conn)
+        comps, sup_rows, sups, perm, temp = _graph(conn)
         v = _version(conn)
         seen_all = _reachable(sups, perm + temp)
         seen_perm = _reachable(sups, perm)
@@ -914,6 +989,11 @@ def get_state():
                 "permanent_reachable": c["id"] in seen_perm if c["in_place"] else None,
                 "last_test": dict(t) if t else None,
             })
+        # supports 保持原字段（全部已登记支承点 id）；检修状态另列
+        all_sups = [r["id"] for r in sup_rows]
+        supports_maintenance = [
+            {"id": r["id"], "name": r["name"], "in_service": False}
+            for r in sup_rows if not r["in_service"]]
         joints = [dict(r, in_place=bool(r["in_place"])) for r in conn.execute(
             "SELECT id, a, b, in_place FROM connections ORDER BY rowid")]
         shores = [dict(r, in_place=bool(r["in_place"])) for r in conn.execute(
@@ -922,7 +1002,9 @@ def get_state():
         return 200, {
             "version": v,
             "last_seq": last,
-            "supports": sups,
+            "supports": all_sups,
+            "supports_in_service": sups,
+            "supports_in_maintenance": supports_maintenance,
             "components": comp_list,
             "connections": joints,
             "temp_supports": shores,
@@ -968,7 +1050,7 @@ def route(method, path, body):
                 "POST /connections         登记榫卯连接（允许的端点组合）",
                 "POST /temp-supports       登记临时支撑",
                 "POST /replacements        登记替换件",
-                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑回执",
+                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑/支承点停启用回执",
                 "POST /plan/preview         预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动）",
                 "POST /plan/confirm         凭据确认：写事务内验签并复核整单，凭据整单仅可用一次",
                 "GET  /steps | /steps/{n}  查询各工序回执与结果",

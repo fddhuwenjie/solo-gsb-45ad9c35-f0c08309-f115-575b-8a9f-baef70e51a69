@@ -2,7 +2,8 @@
 
 仅用 **Python 标准库**（`http.server` + `sqlite3`）实现的木构件修复验收服务。
 登记固定支承点、承重构件（含最低试载值）、榫卯连接、临时支撑与替换件；
-按递增工序号提交拆卸 / 安装 / 试载 / 卸撑回执；每个工序重建当前连接图并做结构校验；
+按递增工序号提交拆卸 / 安装 / 试载 / 卸撑 / **支承点停用检修·重新启用**回执；
+每个工序重建当前连接图并做结构校验；
 支持整单工序的施工预案（预演 + 服务端密钥签发的凭据确认，写事务内验签并复核）；
 卸撑完成后可固化不可改写的验收快照。
 
@@ -20,16 +21,34 @@ docker compose up --build
 ## 验收规则
 
 - **工序递增**：`POST /steps` 的 `seq` 必须等于上一条已接受回执 +1，跳号整步拒绝。
+- **固定支承点停用检修 / 重新启用**：施工期间可用工序 `deactivate_support` /
+  `activate_support` 暂时停用某个固定支承点检修、完工后按工序启用。
+  - 停用与启用是**普通工序**：纳入 `/steps` 与施工预案（预演逐步可见、不落库；
+    凭据随停启后的状态变化失效；确认失败整单回滚、成功只可提交一次）。
+  - 停用后该点**不提供传力路径**：它从连接图的支承根与在位节点集合中剔除，
+    挂在它身上的连接与临时支撑沿路不生效；也**不得以它为端点新安装**连接或
+    临时支撑（409 `support_out_of_service`）。
+  - 停用工序提交后仍按施工中可达性校验：若某在位构件无法经**其他在用支承点**
+    获得施工期支承，按原有 409 `unreachable` 语义指出**首个受影响构件**，整步
+    不留改动（版本、回执、支承点状态均不变）。
+  - 启用后按**当前连接**重新检查路径（挂在该点上、仍在位的连接自动重新参与）。
+  - **每次停启都递增连接状态版本**：旧试载一律失效；卸撑与验收快照只认当前
+    版本的合格试载，历史快照不改。
+  - 检修状态持久化在 SQLite（`supports.in_service`），**旧库启动自动补列、
+    既有支承点默认在用**；`GET /state` 的 `supports` 字段保持原样（全部已登记
+    支承点 id），另以 `supports_in_service` / `supports_in_maintenance` 显示
+    检修状态；`GET /supports` 每行含布尔字段 `in_service`。
 - **连接在位判定**：榫卯连接/临时支撑只有**自身在位且两端构件均实际在位**
-  （固定支承点恒在位）才参与施工与永久连通性判断。为尚未安装的替换件预登记的
-  默认在位榫卯只是"允许端点组合"，在替换件实际安装前沿路不生效；该规则在重建
+  （在用固定支承点恒在位，停用检修的支承点不在位）才参与施工与永久连通性判断。
+  为尚未安装的替换件预登记的默认在位榫卯只是"允许端点组合"，在替换件实际安装前
+  沿路不生效；挂在停用检修支承点身上的连接/支撑同样沿路不生效。该规则在重建
   连接图时实时计算，数据库中已登记的同类记录同样遵循，无需迁移。
 - **施工中可达性**：每个改变连接图的工序提交后、以及试载时重建连接图——每个在位
   承重构件必须能经**在位连接或临时支撑**抵达某个固定支承点，否则整步回滚。
 - **卸撑**：卸除临时支撑后，每个在位承重构件必须**仅凭永久连接**抵达支承点，且每个构件
   都有在**当前连接状态版本**下通过、载荷不低于其 `min_load` 的试载记录。
-- **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件）版本 +1；试载记录当时版本，
-  图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
+- **连接状态版本**：永久连接图每次变化（装/拆连接、拆/装构件、支承点停用/启用）
+  版本 +1；试载记录当时版本，图一变旧试载即失效。临时支撑的搭设/卸除不影响版本。
 - **改接限制**：安装连接只允许使用事先登记的端点组合（`POST /connections` 登记的 id）。
 - **整步拒绝**：跳号、端点不在位、可达性或卸撑条件不满足时返回 409，
   响应含 `first_affected_component`（首个受影响构件），已有回执与状态不变。
@@ -59,7 +78,7 @@ docker compose up --build
 | POST | `/replacements` | 登记替换件 `{id, name, min_load}`（初始不在位） |
 | POST | `/connections` | 登记榫卯连接 `{id, a, b, in_place?}`（默认 true；改接预留组合传 false） |
 | POST | `/temp-supports` | 登记临时支撑 `{id, a, b, in_place?}`（默认 false） |
-| POST | `/steps` | 提交工序回执（见下） |
+| POST | `/steps` | 提交工序回执（见下；含支承点停用/启用） |
 | POST | `/plan/preview` | 预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动） |
 | POST | `/plan/confirm` | 凭据确认：写事务内验签并复核整单，凭据整单仅可用一次 |
 | GET | `/steps`、`/steps/{seq}` | 查询各工序回执与结果 |
@@ -84,6 +103,10 @@ docker compose up --build
 {"seq": 4, "action": "test_load", "component": "C1", "load": 12}
 // 卸撑
 {"seq": 6, "action": "remove_support", "id": "T1"}
+// 固定支承点停用检修（停用后该点不参与传力，须保证各构件仍可达其他在用支承点）
+{"seq": 7, "action": "deactivate_support", "id": "S1"}
+// 检修完成后重新启用（按当前连接复验路径；停启均换版，旧试载失效）
+{"seq": 8, "action": "activate_support", "id": "S1"}
 ```
 
 ## 可执行调用示例
@@ -305,6 +328,118 @@ curl $B/snapshots/1
 #   此后继续修复只增不改，快照 1 保持原样
 ```
 
+## 固定支承点检修：停用受阻、绕行停用与启用后复验
+
+施工期间可暂时停用某个固定支承点检修，完工后按工序启用。停启是普通工序
+（`deactivate_support` / `activate_support`，只有 `id` 字段），同样遵守工序
+递增、整步回滚与预案预演/确认规则；停用后该点不提供传力路径、其上连接/支撑
+沿路失效，也不得以它为端点新装连接或支撑；每次停启都换版，旧试载失效。
+
+一键执行（含 34 条断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_support_maintenance.sh
+```
+
+逐条手动执行：
+
+```bash
+B=http://localhost:8080
+
+# 0) 登记：两支承点、两根梁；MC1 同时连 MS1/MS2，MC2 只连 MS1；
+#    MJ4 是预登记的改接组合（MC2—MS2），供绕行时安装
+curl -X POST $B/supports      -d '{"id":"MS1","name":"北柱础"}'
+curl -X POST $B/supports      -d '{"id":"MS2","name":"南台基"}'
+curl -X POST $B/components    -d '{"id":"MC1","name":"主梁","min_load":10}'
+curl -X POST $B/components    -d '{"id":"MC2","name":"次梁","min_load":8}'
+curl -X POST $B/connections   -d '{"id":"MJ1","a":"MS1","b":"MC1"}'
+curl -X POST $B/connections   -d '{"id":"MJ2","a":"MS2","b":"MC1"}'
+curl -X POST $B/connections   -d '{"id":"MJ3","a":"MS1","b":"MC2"}'
+curl -X POST $B/connections   -d '{"id":"MJ4","a":"MC2","b":"MS2","in_place":false}'
+curl -X POST $B/steps -d '{"seq":1,"action":"test_load","component":"MC1","load":11}'
+
+# 1) 停用受阻：MC2 只能经 MS1 获得施工期支承 → 409 指出首个受影响构件 MC2，
+#    整步不留改动（无回执、版本仍为 v0、MS1 仍在用）
+curl -X POST $B/steps -d '{"seq":2,"action":"deactivate_support","id":"MS1"}'
+#   → 409 unreachable
+#     {"error":"unreachable",
+#      "message":"本工序后构件 MC2 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
+#      "first_affected_component":"MC2"}
+curl $B/state
+#   → "version":0、"last_seq":1、"supports_in_maintenance":[]
+
+# 2) 借助其他支承点绕行：先按原工序把 MC2 改接到 MS2（安装已登记组合 MJ4），
+#    再停用 MS1；此时 MC1/MC2 均经 MS2 获得支承
+curl -X POST $B/steps -d '{"seq":2,"action":"install","target":"connection","id":"MJ4"}'
+#   → 201，版本 → v1
+curl -X POST $B/steps -d '{"seq":3,"action":"deactivate_support","id":"MS1"}'
+#   → 201 result={"support":"MS1","in_service":false,"maintenance":true,"version":2}
+curl $B/state
+#   → "supports":["MS1","MS2"]（原字段保留，为全部已登记支承点）
+#     "supports_in_service":["MS2"]
+#     "supports_in_maintenance":[{"id":"MS1","name":"北柱础","in_service":false}]
+#     MJ1/MJ3 虽仍在登记簿在位，但端点 MS1 已停用，沿路不生效
+
+# 3) 停用期间不得以 MS1 为端点新安装连接或临时支撑
+curl -X POST $B/temp-supports -d '{"id":"MT9","a":"MS1","b":"MC1"}'
+curl -X POST $B/steps -d '{"seq":4,"action":"install","target":"temp_support","id":"MT9"}'
+#   → 409 support_out_of_service，first_affected_component=MS1，整步拒绝
+curl -X POST $B/steps -d '{"seq":4,"action":"deactivate_support","id":"MS1"}'
+#   → 409（重复停用）
+
+# 4) 每次停启旧试载失效：seq 1 的 v0 试载不被卸撑/快照承认
+curl -X POST $B/snapshots -d '{}'
+#   → 409 test_load_missing，first_affected_component=MC1（当前版本 v2 无合格试载）
+
+# 5) 启用后复验：按当前连接重新检查路径，并再换一版；之后须在新版本重新试载
+curl -X POST $B/steps -d '{"seq":4,"action":"activate_support","id":"MS1"}'
+#   → 201 result={"support":"MS1","in_service":true,"maintenance":false,"version":3}
+#     MJ1/MJ3 随 MS1 启用自动重新参与路径
+curl -X POST $B/steps -d '{"seq":5,"action":"test_load","component":"MC1","load":12}'
+curl -X POST $B/steps -d '{"seq":6,"action":"test_load","component":"MC2","load":9}'
+curl -X POST $B/snapshots -d '{}'          # → 201 快照 1（v3）
+
+# 6) 历史快照不改：之后再次停用（v4）不影响快照 1
+curl -X POST $B/steps -d '{"seq":7,"action":"deactivate_support","id":"MS1"}'
+curl $B/snapshots/1
+#   → 仍为 "version":3、"last_seq":6、"supports":["MS1","MS2"]、
+#     "supports_in_maintenance":[]
+```
+
+停启同样纳入施工预案：预演清单中可直接包含 `deactivate_support` /
+`activate_support`，逐步套用路径与换版规则（后一步能看到前一步的停启影响），
+失败附 `failed_step` 且不落库；预演后任何一次停启改变状态，原凭据即 409
+`plan_stale`；确认在写事务内验签并复核整单，失败整单回滚、成功仅可提交一次：
+
+```bash
+# 当前 MS1 停用中（见上，演示流程此时 last_seq=9）。预演“再停用唯一在用根
+# MS2”必失败、不落库（seq 由服务端从末条回执后连续补齐）
+curl -X POST $B/plan/preview -d '{"steps":[
+  {"action":"deactivate_support","id":"MS2"}
+]}'
+#   → 409 unreachable，first_affected_component=MC1，
+#     failed_step={"index":0,"seq":10,"action":"deactivate_support"}
+
+# 预演“启用 MS1 + 当前版本重新试载”，成功后取得 planv2- 凭据
+STEPS='[
+  {"action":"activate_support","id":"MS1"},
+  {"action":"test_load","component":"MC1","load":14},
+  {"action":"test_load","component":"MC2","load":11}
+]'
+TOKEN=$(curl -s -X POST $B/plan/preview -d "{\"steps\":$STEPS}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+# 预演后直接执行一次启用（停启改变状态）→ 原凭据失效
+curl -X POST $B/steps -d '{"seq":10,"action":"activate_support","id":"MS1"}'
+curl -X POST $B/plan/confirm -d "{\"steps\":$STEPS,\"token\":\"$TOKEN\"}"
+#   → 409 plan_stale；需按新状态重新预演后再确认（成功仅可提交一次）
+```
+
+旧库兼容：升级后首次启动自动为 `supports` 补列 `in_service`，既有支承点默认
+在用，历史连接状态版本与既有快照保持不变；`GET /supports` 返回行新增
+`in_service` 布尔字段，`GET /state` 在保留 `supports` 原字段的同时给出
+`supports_in_service` 与 `supports_in_maintenance`。
+
 ## 错误响应
 
 统一 JSON：`{"error": <code>, "message": ..., ...}`。工序拒绝一律 409 且状态不变：
@@ -314,7 +449,8 @@ curl $B/snapshots/1
 | `sequence_gap` | 工序跳号（附 `expected`/`got`） |
 | `not_registered` | 连接/支撑/构件未事先登记 |
 | `endpoint_not_in_place` | 端点不在位（附 `first_affected_component`） |
-| `not_in_place` / `already_in_place` | 拆卸/安装对象状态不符 |
+| `support_out_of_service` | 固定支承点已停用检修：重复停用，或以其为端点新安装连接/临时支撑 |
+| `not_in_place` / `already_in_place` | 拆卸/安装对象状态不符（含重复启用在用支承点） |
 | `unreachable` | 工序后（含试载时）构件无法经在位连接或临时支撑抵达固定支承点 |
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
 | `test_load_missing` | 构件缺少当前连接状态下通过的合格试载 |
@@ -332,6 +468,7 @@ Dockerfile          # python:3.12-slim 单容器镜像
 docker-compose.yml  # 单条命令启动，卷持久化
 demo.sh             # 端到端演示脚本
 demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现与修复演示
+demo_support_maintenance.sh      # 支承点检修：停用受阻/绕行停用/启用后复验演示
 demo_plan.sh        # 施工预案演示：预演 → 过期拒绝 → 一次写事务确认
 README.md
 ```
